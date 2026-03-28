@@ -13,6 +13,10 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from tqdm import tqdm
 import time
+import multiprocessing
+from dask.distributed import Client, LocalCluster
+import dask.bag as db
+from functools import partial
 
 import pyro
 import pyro.distributions as dist
@@ -135,7 +139,19 @@ def plot_fitted_model(data, weights, mu, scale, lam, threshold, gRNA, output_dir
     Y2 = weights[1] * stats.norm.pdf(X, mu, scale)
 
     fig, ax = plt.subplots(figsize=(8, 3), dpi=300)
-    sns.histplot(data, binwidth=0.5, color='grey', stat = "proportion")
+    
+    # Use adaptive binwidth or bins based on data range to avoid errors with small ranges
+    data_range = max(data) - min(data)
+    if data_range > 1.0:
+        sns.histplot(data, binwidth=0.5, color='grey', stat="proportion", ax=ax)
+    elif data_range > 0:
+        # For small ranges, use a fixed number of bins instead of binwidth
+        n_bins = max(10, int(len(data) / 5))
+        sns.histplot(data, bins=n_bins, color='grey', stat="proportion", ax=ax)
+    else:
+        # If all values are identical, just plot a single bar
+        sns.histplot(data, bins=1, color='grey', stat="proportion", ax=ax)
+    
     ax.plot(X, Y1, "r-", label = "Poisson")
     ax.plot(X, Y2, "b-", label = "Normal")
     ax.plot(X, Y1 + Y2, "k--", label = "Mixture model")
@@ -252,20 +268,50 @@ def fit_PGMM(gRNA, adata_crispr, output_dir, seed, n_iter):
     plot_loss(losses, gRNA, output_dir)
     
     # threshold for which probability is higher to belong to the normal component
-    X = np.arange(1, max(selected_guide.toarray())+1, 1)
+    X = np.arange(1, selected_guide.toarray().max()+1, 1)
     log_X = np.log2(X)
     df = pd.DataFrame({'t': X, 'prob_normal_component': prob_normal_component(log_X, weights, mu, scale, lam)})
     threshold = df.loc[(df.prob_normal_component > 0.5), 't'].min()
     
     # create plot of the mixture distribution
-    plot_fitted_model(data, weights, mu, scale, lam, np.log2(threshold), gRNA, output_dir)
+    try:
+        plot_fitted_model(data, weights, mu, scale, lam, np.log2(threshold), gRNA, output_dir)
+    except Exception as e:
+        print(f"Error plotting fitted model for {gRNA}: {e}")
+        print(data)
+        print(weights)
+        print(mu)
+        print(scale)
+        print(lam)
+        print(threshold)
+        raise RuntimeError("Error plotting fitted model.")
+        
     
     # get cells with gRNA counts above the threshold
     perturbed_cells = adata_crispr.obs_names[selected_guide.toarray().reshape(-1) >= threshold].tolist()
     return(perturbed_cells, threshold, losses[-1], estimates)
 
 
-def ga_poisson_gauss(input_file, output_dir, start_gRNA = 0, step = None, n_iter = 500, n_counts = None, UMI_threshold = 0):
+def parallel_assignment(gRNA, adata_crispr, output_dir, seed, n_iter):
+    '''
+    Wrapper function for fit_PGMM to enable parallel processing
+    
+    Args:
+        gRNA (str): name of the gRNA
+        adata_crispr (AnnData): anndata object with UMI counts of CRISPR Guide Capture
+        output_dir (str): directory in which the resulting plots will be saved
+        seed (int): seed used for pyro
+        n_iter (int): number of steps for training the model
+    
+    Returns:
+        Tuple of (gRNA name, perturbed cells, threshold, loss, estimates)
+    '''
+    perturbed_cells, threshold, loss, map_estimates = fit_PGMM(gRNA, adata_crispr, output_dir, seed, n_iter)
+    return (gRNA, perturbed_cells, threshold, loss, map_estimates)
+
+
+def ga_poisson_gauss(input_file, output_dir, start_gRNA = 0, step = None, n_iter = 500, n_counts = None, UMI_threshold = 0,
+                     parallelize = True, n_processes = None, mem_limit = '10GB'):
     '''
     Guide assignment in which a Poisson-Gaussian mixture model is fitted to the non-zero log-transformed UMI counts
     
@@ -277,6 +323,9 @@ def ga_poisson_gauss(input_file, output_dir, start_gRNA = 0, step = None, n_iter
         n_iter (int, optional): number of steps for training the model
         n_counts (int, optional): subsample the gRNA counts per cell to a total of n_counts. If None (default), the UMI count matrix is used without any downsampling.
         UMI_threshold (int, optional): Additional UMI threshold for assigned cells which is applied after creating the initial assignment to remove cells with fewer UMI counts than this threshold (default: no additional UMI threshold)
+        parallelize (bool, optional): whether to parallelize the computation over the gRNAs (default = True)
+        n_processes (int, optional): specifies number of processes to use for parallelization if parallelize = True. If set to None (default), all available CPUs will be used (if this number is not higher than the number of gRNAs).
+        mem_limit (str, optional): set memory limit for the dask cluster (default: 10GB)
         
     Returns:
         None
@@ -310,18 +359,70 @@ def ga_poisson_gauss(input_file, output_dir, start_gRNA = 0, step = None, n_iter
     losses = pd.DataFrame()
     estimates = pd.DataFrame()
     
-    print('Fit Poisson-Gaussian Mixture Model for each gRNA: ')
-    for gRNA in tqdm(gRNA_list):
-        time.sleep(0.01)
-        perturbed_cells, threshold, loss, map_estimates = fit_PGMM(gRNA, adata_crispr, output_dir, 2024, n_iter)
-        if len(perturbed_cells) != 0:
-            # get UMI_counts of assigned cells
-            UMI_counts = adata_crispr[perturbed_cells, [gRNA]].X.toarray().reshape(-1)
-            df = pd.DataFrame({'cell': perturbed_cells, 'gRNA': gRNA, 'UMI_counts': UMI_counts})
-            perturbations = pd.concat([perturbations, df], ignore_index = True)
-            thresholds = pd.concat([thresholds, pd.DataFrame({'gRNA': [gRNA], 'threshold': [threshold]})])
-            losses = pd.concat([losses, pd.DataFrame({'gRNA': [gRNA], 'loss': [loss]})])
-            estimates = pd.concat([estimates, map_estimates])
+    print('Fit Poisson-Gaussian Mixture Model for each gRNA')
+    
+    if parallelize:
+        if n_processes == None:
+            n_processes = os.cpu_count() # if not specified all available CPUs will be used
+        if n_processes > len(gRNA_list):
+            n_processes = len(gRNA_list)
+        print(str(n_processes) + ' parallel processes used')
+        
+        try:
+            # start a local Dask cluster
+            cluster = LocalCluster(n_workers = n_processes, threads_per_worker = 1, memory_limit = mem_limit)
+            client = Client(cluster, heartbeat_interval='5s', timeout='30s')
+            
+            # Scatter the large adata object once to all workers to avoid repeated serialization
+            scattered_adata = client.scatter(adata_crispr, broadcast=True)
+            
+            # run in parallel over gRNAs with progress tracking
+            # Use tqdm to track progress
+            with tqdm(total=len(gRNA_list), desc="Processing gRNAs") as pbar:
+                # Process in chunks and update progress as each completes
+                results = []
+                for gRNA in gRNA_list:
+                    # Pass scattered_adata directly as argument so Dask can resolve the Future
+                    future = client.submit(parallel_assignment, gRNA, scattered_adata, output_dir, 2024, n_iter)
+                    future.add_done_callback(lambda _: pbar.update())
+                    results.append(future)
+                
+                # Gather all results
+                from dask.distributed import as_completed
+                results = [f.result() for f in results]
+            
+            client.close()
+            cluster.close()
+            
+            # combine the results per gRNA
+            for gRNA, perturbed_cells, threshold, loss, map_estimates in results:
+                if len(perturbed_cells) != 0:
+                    # get UMI_counts of assigned cells
+                    UMI_counts = adata_crispr[perturbed_cells, [gRNA]].X.toarray().reshape(-1)
+                    df = pd.DataFrame({'cell': perturbed_cells, 'gRNA': gRNA, 'UMI_counts': UMI_counts})
+                    perturbations = pd.concat([perturbations, df], ignore_index = True)
+                    thresholds = pd.concat([thresholds, pd.DataFrame({'gRNA': [gRNA], 'threshold': [threshold]})])
+                    losses = pd.concat([losses, pd.DataFrame({'gRNA': [gRNA], 'loss': [loss]})])
+                    estimates = pd.concat([estimates, map_estimates])
+                    
+        except (FileNotFoundError, RuntimeError, OSError) as e:
+            print(f"Warning: Parallel processing failed ({type(e).__name__}: {e})")
+            print("Falling back to sequential processing...")
+            parallelize = False  # Fall through to sequential execution below
+    
+    # Fit Poisson-Gaussian Mixture Model without parallelization
+    if not parallelize:
+        for gRNA in tqdm(gRNA_list):
+            time.sleep(0.01)
+            perturbed_cells, threshold, loss, map_estimates = fit_PGMM(gRNA, adata_crispr, output_dir, 2024, n_iter)
+            if len(perturbed_cells) != 0:
+                # get UMI_counts of assigned cells
+                UMI_counts = adata_crispr[perturbed_cells, [gRNA]].X.toarray().reshape(-1)
+                df = pd.DataFrame({'cell': perturbed_cells, 'gRNA': gRNA, 'UMI_counts': UMI_counts})
+                perturbations = pd.concat([perturbations, df], ignore_index = True)
+                thresholds = pd.concat([thresholds, pd.DataFrame({'gRNA': [gRNA], 'threshold': [threshold]})])
+                losses = pd.concat([losses, pd.DataFrame({'gRNA': [gRNA], 'loss': [loss]})])
+                estimates = pd.concat([estimates, map_estimates])
     
     # Optional filtering to assigned cells that have at least 'UMI_threshold' counts
     if perturbations.shape[0] != 0:
