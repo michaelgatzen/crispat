@@ -13,7 +13,6 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from tqdm import tqdm
 import time
-import multiprocessing
 from dask.distributed import Client, LocalCluster
 import dask.bag as db
 from functools import partial
@@ -368,50 +367,44 @@ def ga_poisson_gauss(input_file, output_dir, start_gRNA = 0, step = None, n_iter
             n_processes = len(gRNA_list)
         print(str(n_processes) + ' parallel processes used')
         
-        try:
-            # start a local Dask cluster
-            cluster = LocalCluster(n_workers = n_processes, threads_per_worker = 1, memory_limit = mem_limit)
-            client = Client(cluster, heartbeat_interval='5s', timeout='30s')
+        # start a local Dask cluster
+        cluster = LocalCluster(n_workers = n_processes, threads_per_worker = 1, memory_limit = mem_limit)
+        client = Client(cluster, heartbeat_interval='5s', timeout='30s')
+        
+        # Scatter the large adata object once to all workers to avoid repeated serialization
+        scattered_adata = client.scatter(adata_crispr, broadcast=True)
+        
+        # run in parallel over gRNAs with progress tracking
+        # Use tqdm to track progress
+        with tqdm(total=len(gRNA_list), desc="Processing gRNAs") as pbar:
+            # Process in chunks and update progress as each completes
+            results = []
+            for gRNA in gRNA_list:
+                # Pass scattered_adata directly as argument so Dask can resolve the Future
+                future = client.submit(parallel_assignment, gRNA, scattered_adata, output_dir, 2024, n_iter)
+                future.add_done_callback(lambda _: pbar.update())
+                results.append(future)
             
-            # Scatter the large adata object once to all workers to avoid repeated serialization
-            scattered_adata = client.scatter(adata_crispr, broadcast=True)
-            
-            # run in parallel over gRNAs with progress tracking
-            # Use tqdm to track progress
-            with tqdm(total=len(gRNA_list), desc="Processing gRNAs") as pbar:
-                # Process in chunks and update progress as each completes
-                results = []
-                for gRNA in gRNA_list:
-                    # Pass scattered_adata directly as argument so Dask can resolve the Future
-                    future = client.submit(parallel_assignment, gRNA, scattered_adata, output_dir, 2024, n_iter)
-                    future.add_done_callback(lambda _: pbar.update())
-                    results.append(future)
-                
-                # Gather all results
-                from dask.distributed import as_completed
-                results = [f.result() for f in results]
-            
-            client.close()
-            cluster.close()
-            
-            # combine the results per gRNA
-            for gRNA, perturbed_cells, threshold, loss, map_estimates in results:
-                if len(perturbed_cells) != 0:
-                    # get UMI_counts of assigned cells
-                    UMI_counts = adata_crispr[perturbed_cells, [gRNA]].X.toarray().reshape(-1)
-                    df = pd.DataFrame({'cell': perturbed_cells, 'gRNA': gRNA, 'UMI_counts': UMI_counts})
-                    perturbations = pd.concat([perturbations, df], ignore_index = True)
-                    thresholds = pd.concat([thresholds, pd.DataFrame({'gRNA': [gRNA], 'threshold': [threshold]})])
-                    losses = pd.concat([losses, pd.DataFrame({'gRNA': [gRNA], 'loss': [loss]})])
-                    estimates = pd.concat([estimates, map_estimates])
-                    
-        except (FileNotFoundError, RuntimeError, OSError) as e:
-            print(f"Warning: Parallel processing failed ({type(e).__name__}: {e})")
-            print("Falling back to sequential processing...")
-            parallelize = False  # Fall through to sequential execution below
+            # Gather all results
+            from dask.distributed import as_completed
+            results = [f.result() for f in results]
+        
+        client.close()
+        cluster.close()
+        
+        # combine the results per gRNA
+        for gRNA, perturbed_cells, threshold, loss, map_estimates in results:
+            if len(perturbed_cells) != 0:
+                # get UMI_counts of assigned cells
+                UMI_counts = adata_crispr[perturbed_cells, [gRNA]].X.toarray().reshape(-1)
+                df = pd.DataFrame({'cell': perturbed_cells, 'gRNA': gRNA, 'UMI_counts': UMI_counts})
+                perturbations = pd.concat([perturbations, df], ignore_index = True)
+                thresholds = pd.concat([thresholds, pd.DataFrame({'gRNA': [gRNA], 'threshold': [threshold]})])
+                losses = pd.concat([losses, pd.DataFrame({'gRNA': [gRNA], 'loss': [loss]})])
+                estimates = pd.concat([estimates, map_estimates])
     
     # Fit Poisson-Gaussian Mixture Model without parallelization
-    if not parallelize:
+    else:
         for gRNA in tqdm(gRNA_list):
             time.sleep(0.01)
             perturbed_cells, threshold, loss, map_estimates = fit_PGMM(gRNA, adata_crispr, output_dir, 2024, n_iter)
