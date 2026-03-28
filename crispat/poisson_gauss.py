@@ -13,6 +13,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from tqdm import tqdm
 import time
+import multiprocessing
 from dask.distributed import Client, LocalCluster
 import dask.bag as db
 from functools import partial
@@ -366,6 +367,15 @@ def ga_poisson_gauss(input_file, output_dir, start_gRNA = 0, step = None, n_iter
         if n_processes > len(gRNA_list):
             n_processes = len(gRNA_list)
         print(str(n_processes) + ' parallel processes used')
+        
+        # Set multiprocessing start method to 'fork' for compatibility with workflow systems
+        # This avoids the FileNotFoundError when running from stdin in environments like Cromwell
+        try:
+            if multiprocessing.get_start_method(allow_none=True) != 'fork':
+                multiprocessing.set_start_method('fork', force=True)
+        except RuntimeError:
+            # Start method already set, continue with existing method
+            pass
         
         # start a local Dask cluster
         cluster = LocalCluster(n_workers = n_processes, threads_per_worker = 1, memory_limit = mem_limit)
