@@ -11,12 +11,11 @@ from scipy import sparse, stats, special
 from scipy.sparse import csr_matrix
 import matplotlib.pyplot as plt
 import seaborn as sns
-from tqdm import tqdm
 import time
 import multiprocessing
-from dask.distributed import Client, LocalCluster
-import dask.bag as db
 from functools import partial
+from datetime import datetime
+import threading
 
 import pyro
 import pyro.distributions as dist
@@ -292,26 +291,79 @@ def fit_PGMM(gRNA, adata_crispr, output_dir, seed, n_iter):
     return(perturbed_cells, threshold, losses[-1], estimates)
 
 
-def parallel_assignment(gRNA, adata_crispr, output_dir, seed, n_iter):
+def process_gRNA_chunk(chunk_data):
     '''
-    Wrapper function for fit_PGMM to enable parallel processing
+    Process a chunk of gRNAs in parallel
     
     Args:
-        gRNA (str): name of the gRNA
-        adata_crispr (AnnData): anndata object with UMI counts of CRISPR Guide Capture
-        output_dir (str): directory in which the resulting plots will be saved
-        seed (int): seed used for pyro
-        n_iter (int): number of steps for training the model
+        chunk_data (tuple): (chunk_index, gRNA_chunk, adata_crispr, output_dir, seed, n_iter, progress_counters)
     
     Returns:
-        Tuple of (gRNA name, perturbed cells, threshold, loss, estimates)
+        List of tuples (gRNA name, perturbed cells, threshold, loss, estimates) for each gRNA in chunk
     '''
-    perturbed_cells, threshold, loss, map_estimates = fit_PGMM(gRNA, adata_crispr, output_dir, seed, n_iter)
-    return (gRNA, perturbed_cells, threshold, loss, map_estimates)
+    chunk_idx, gRNA_chunk, adata_crispr, output_dir, seed, n_iter, progress_counters = chunk_data
+    results = []
+    for gRNA in gRNA_chunk:
+        perturbed_cells, threshold, loss, map_estimates = fit_PGMM(gRNA, adata_crispr, output_dir, seed, n_iter)
+        results.append((gRNA, perturbed_cells, threshold, loss, map_estimates))
+        # Update progress counter for this chunk
+        if progress_counters is not None:
+            progress_counters[chunk_idx] += 1
+    return results
+
+
+def print_progress_report(start_time, total_gRNAs, progress_counters, chunk_sizes, stop_event, report_interval, mode="parallel"):
+    '''
+    Periodically print progress report every 30 seconds
+    
+    Args:
+        start_time (datetime): when processing started
+        total_gRNAs (int): total number of gRNAs to process
+        progress_counters (list): shared list of progress counters for each process/chunk
+        chunk_sizes (list): list of chunk sizes (number of gRNAs per chunk)
+        stop_event (threading.Event): event to signal when to stop printing
+        report_interval (int): interval in seconds between progress reports
+        mode (str): "parallel" or "sequential"
+    '''
+    while not stop_event.wait(report_interval):  # Wait for report_interval seconds or until stop_event is set
+        current_time = datetime.now()
+        elapsed = (current_time - start_time).total_seconds()
+        
+        # Count total processed
+        total_processed = sum(progress_counters)
+        
+        # Calculate estimated completion
+        if total_processed > 0:
+            rate = total_processed / elapsed  # gRNAs per second
+            remaining = total_gRNAs - total_processed
+            eta_seconds = remaining / rate
+            estimated_end = current_time + pd.Timedelta(seconds=eta_seconds)
+            remaining_str = str(pd.Timedelta(seconds=int(eta_seconds)))
+        else:
+            estimated_end = "N/A"
+            remaining_str = "N/A"
+        
+        # Format elapsed time
+        elapsed_str = str(pd.Timedelta(seconds=int(elapsed)))
+        
+        # Print report
+        print(f"\n{'='*70}")
+        print(f"Progress Report - {current_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"Elapsed time: {elapsed_str}")
+        print(f"Estimated remaining: {remaining_str}")
+        print(f"Estimated completion: {estimated_end if isinstance(estimated_end, str) else estimated_end.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"Total progress: {total_processed}/{total_gRNAs} gRNAs ({100*total_processed/total_gRNAs:.1f}%)")
+        
+        if mode == "parallel" and len(progress_counters) > 1:
+            print(f"Per-process counts:")
+            for i, (count, total) in enumerate(zip(progress_counters, chunk_sizes)):
+                print(f"  Process {i+1:>3}: {count:>5}/{total:>5} gRNAs completed ({100*count/total:.1f}%)")
+        
+        print(f"{'='*70}\n")
 
 
 def ga_poisson_gauss(input_file, output_dir, start_gRNA = 0, step = None, n_iter = 500, n_counts = None, UMI_threshold = 0,
-                     parallelize = True, n_processes = None, mem_limit = '10GB'):
+                     parallelize = True, n_processes = None, report_interval_seconds = 30):
     '''
     Guide assignment in which a Poisson-Gaussian mixture model is fitted to the non-zero log-transformed UMI counts
     
@@ -324,8 +376,8 @@ def ga_poisson_gauss(input_file, output_dir, start_gRNA = 0, step = None, n_iter
         n_counts (int, optional): subsample the gRNA counts per cell to a total of n_counts. If None (default), the UMI count matrix is used without any downsampling.
         UMI_threshold (int, optional): Additional UMI threshold for assigned cells which is applied after creating the initial assignment to remove cells with fewer UMI counts than this threshold (default: no additional UMI threshold)
         parallelize (bool, optional): whether to parallelize the computation over the gRNAs (default = True)
-        n_processes (int, optional): specifies number of processes to use for parallelization if parallelize = True. If set to None (default), all available CPUs will be used (if this number is not higher than the number of gRNAs).
-        mem_limit (str, optional): set memory limit for the dask cluster (default: 10GB)
+        n_processes (int, optional): specifies number of processes to use for parallelization if parallelize = True. If set to None (default), all available CPUs will be used.
+        report_interval_seconds (int, optional): interval in seconds between progress reports (default = 30)
         
     Returns:
         None
@@ -366,43 +418,61 @@ def ga_poisson_gauss(input_file, output_dir, start_gRNA = 0, step = None, n_iter
             n_processes = os.cpu_count() # if not specified all available CPUs will be used
         if n_processes > len(gRNA_list):
             n_processes = len(gRNA_list)
-        print(str(n_processes) + ' parallel processes used')
+        print(f'{n_processes} parallel processes used')
         
-        # Set multiprocessing start method to 'fork' for compatibility with workflow systems
-        # This avoids the FileNotFoundError when running from stdin in environments like Cromwell
-        try:
-            if multiprocessing.get_start_method(allow_none=True) != 'fork':
-                multiprocessing.set_start_method('fork', force=True)
-        except RuntimeError:
-            # Start method already set, continue with existing method
-            pass
+        # Split gRNAs into exactly n_processes chunks
+        # Distribute gRNAs as evenly as possible across chunks
+        chunk_size = len(gRNA_list) // n_processes
+        remainder = len(gRNA_list) % n_processes
         
-        # start a local Dask cluster
-        cluster = LocalCluster(n_workers = n_processes, threads_per_worker = 1, memory_limit = mem_limit)
-        client = Client(cluster, heartbeat_interval='5s', timeout='30s')
+        gRNA_chunks = []
+        start = 0
+        for i in range(n_processes):
+            # First 'remainder' chunks get one extra gRNA
+            end = start + chunk_size + (1 if i < remainder else 0)
+            gRNA_chunks.append(gRNA_list[start:end])
+            start = end
         
-        # Scatter the large adata object once to all workers to avoid repeated serialization
-        scattered_adata = client.scatter(adata_crispr, broadcast=True)
+        # Create shared progress counters
+        manager = multiprocessing.Manager()
+        progress_counters = manager.list([0] * len(gRNA_chunks))
+        chunk_sizes = [len(chunk) for chunk in gRNA_chunks]
         
-        # run in parallel over gRNAs with progress tracking
-        # Use tqdm to track progress
-        with tqdm(total=len(gRNA_list), desc="Processing gRNAs") as pbar:
-            # Process in chunks and update progress as each completes
-            results = []
-            for gRNA in gRNA_list:
-                # Pass scattered_adata directly as argument so Dask can resolve the Future
-                future = client.submit(parallel_assignment, gRNA, scattered_adata, output_dir, 2024, n_iter)
-                future.add_done_callback(lambda _: pbar.update())
-                results.append(future)
-            
-            # Gather all results
-            from dask.distributed import as_completed
-            results = [f.result() for f in results]
+        # Prepare chunk data with progress tracking
+        chunk_data_list = [
+            (i, chunk, adata_crispr, output_dir, 2024, n_iter, progress_counters)
+            for i, chunk in enumerate(gRNA_chunks)
+        ]
         
-        client.close()
-        cluster.close()
+        # Start progress monitoring in background thread
+        start_time = datetime.now()
+        stop_event = threading.Event()
+        monitor_thread = threading.Thread(
+            target=print_progress_report,
+            args=(start_time, len(gRNA_list), progress_counters, chunk_sizes, stop_event, report_interval_seconds, "parallel")
+        )
+        monitor_thread.daemon = True
+        monitor_thread.start()
         
-        # combine the results per gRNA
+        # Process chunks in parallel using multiprocessing.Pool
+        print(f'Processing {len(gRNA_list)} gRNAs in {len(gRNA_chunks)} chunks')
+        print(f'Progress will be reported every {report_interval_seconds} seconds...\n')
+        
+        with multiprocessing.Pool(processes=n_processes) as pool:
+            chunk_results = pool.map(process_gRNA_chunk, chunk_data_list)
+        
+        # Stop progress monitoring
+        stop_event.set()
+        monitor_thread.join(timeout=1)
+        
+        # Print final report
+        elapsed = (datetime.now() - start_time).total_seconds()
+        print(f"\nCompleted processing {len(gRNA_list)} gRNAs in {pd.Timedelta(seconds=int(elapsed))}")
+        
+        # Flatten results from all chunks
+        results = [item for chunk in chunk_results for item in chunk]
+        
+        # Combine the results per gRNA
         for gRNA, perturbed_cells, threshold, loss, map_estimates in results:
             if len(perturbed_cells) != 0:
                 # get UMI_counts of assigned cells
@@ -415,9 +485,28 @@ def ga_poisson_gauss(input_file, output_dir, start_gRNA = 0, step = None, n_iter
     
     # Fit Poisson-Gaussian Mixture Model without parallelization
     else:
-        for gRNA in tqdm(gRNA_list):
-            time.sleep(0.01)
+        # Create progress counter for sequential mode
+        manager = multiprocessing.Manager()
+        progress_counters = manager.list([0])
+        chunk_sizes = [len(gRNA_list)]
+        
+        # Start progress monitoring in background thread
+        start_time = datetime.now()
+        stop_event = threading.Event()
+        monitor_thread = threading.Thread(
+            target=print_progress_report,
+            args=(start_time, len(gRNA_list), progress_counters, chunk_sizes, stop_event, report_interval_seconds, "sequential")
+        )
+        monitor_thread.daemon = True
+        monitor_thread.start()
+        
+        print(f'Processing {len(gRNA_list)} gRNAs sequentially')
+        print(f'Progress will be reported every {report_interval_seconds} seconds...\n')
+        
+        for gRNA in gRNA_list:
             perturbed_cells, threshold, loss, map_estimates = fit_PGMM(gRNA, adata_crispr, output_dir, 2024, n_iter)
+            progress_counters[0] += 1
+            
             if len(perturbed_cells) != 0:
                 # get UMI_counts of assigned cells
                 UMI_counts = adata_crispr[perturbed_cells, [gRNA]].X.toarray().reshape(-1)
@@ -426,6 +515,14 @@ def ga_poisson_gauss(input_file, output_dir, start_gRNA = 0, step = None, n_iter
                 thresholds = pd.concat([thresholds, pd.DataFrame({'gRNA': [gRNA], 'threshold': [threshold]})])
                 losses = pd.concat([losses, pd.DataFrame({'gRNA': [gRNA], 'loss': [loss]})])
                 estimates = pd.concat([estimates, map_estimates])
+        
+        # Stop progress monitoring
+        stop_event.set()
+        monitor_thread.join(timeout=1)
+        
+        # Print final report
+        elapsed = (datetime.now() - start_time).total_seconds()
+        print(f"\nCompleted processing {len(gRNA_list)} gRNAs in {pd.Timedelta(seconds=int(elapsed))}")
     
     # Optional filtering to assigned cells that have at least 'UMI_threshold' counts
     if perturbations.shape[0] != 0:
