@@ -9,13 +9,24 @@ import torch
 from torch.distributions import constraints
 from scipy import sparse, stats, special
 from scipy.sparse import csr_matrix
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend for containerized/headless environments
 import matplotlib.pyplot as plt
 import seaborn as sns
 import time
 import multiprocessing
+# Set multiprocessing start method early for better compatibility
+try:
+    multiprocessing.set_start_method('spawn', force=True)
+except RuntimeError:
+    pass  # Already set
 from functools import partial
 from datetime import datetime
 import threading
+
+# Disable torch's internal parallelism to avoid conflicts with multiprocessing
+import torch
+torch.set_num_threads(1)
 
 import pyro
 import pyro.distributions as dist
@@ -326,40 +337,51 @@ def print_progress_report(start_time, total_gRNAs, progress_counters, chunk_size
         mode (str): "parallel" or "sequential"
     '''
     while not stop_event.wait(report_interval):  # Wait for report_interval seconds or until stop_event is set
-        current_time = datetime.now()
-        elapsed = (current_time - start_time).total_seconds()
-        
-        # Count total processed
-        total_processed = sum(progress_counters)
-        
-        # Calculate estimated completion
-        if total_processed > 0:
-            rate = total_processed / elapsed  # gRNAs per second
-            remaining = total_gRNAs - total_processed
-            eta_seconds = remaining / rate
-            estimated_end = current_time + pd.Timedelta(seconds=eta_seconds)
-            remaining_str = str(pd.Timedelta(seconds=int(eta_seconds)))
-        else:
-            estimated_end = "N/A"
-            remaining_str = "N/A"
-        
-        # Format elapsed time
-        elapsed_str = str(pd.Timedelta(seconds=int(elapsed)))
-        
-        # Print report
-        print(f"\n{'='*70}")
-        print(f"Progress Report - {current_time.strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"Elapsed time: {elapsed_str}")
-        print(f"Estimated remaining: {remaining_str}")
-        print(f"Estimated completion: {estimated_end if isinstance(estimated_end, str) else estimated_end.strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"Total progress: {total_processed}/{total_gRNAs} gRNAs ({100*total_processed/total_gRNAs:.1f}%)")
-        
-        if mode == "parallel" and len(progress_counters) > 1:
-            print(f"Per-process counts:")
-            for i, (count, total) in enumerate(zip(progress_counters, chunk_sizes)):
-                print(f"  Process {i+1:>3}: {count:>5}/{total:>5} gRNAs completed ({100*count/total:.1f}%)")
-        
-        print(f"{'='*70}\n")
+        try:
+            current_time = datetime.now()
+            elapsed = (current_time - start_time).total_seconds()
+            
+            # Count total processed with timeout protection
+            try:
+                # Use list() to copy values quickly, avoiding potential blocking on Manager proxy
+                counter_snapshot = list(progress_counters)
+                total_processed = sum(counter_snapshot)
+            except Exception as e:
+                print(f"Warning: Could not read progress counters: {e}", flush=True)
+                total_processed = 0
+            
+            # Calculate estimated completion
+            if total_processed > 0:
+                rate = total_processed / elapsed  # gRNAs per second
+                remaining = total_gRNAs - total_processed
+                eta_seconds = remaining / rate
+                estimated_end = current_time + pd.Timedelta(seconds=eta_seconds)
+                remaining_str = str(pd.Timedelta(seconds=int(eta_seconds)))
+            else:
+                estimated_end = "N/A"
+                remaining_str = "N/A"
+            
+            # Format elapsed time
+            elapsed_str = str(pd.Timedelta(seconds=int(elapsed)))
+            
+            # Print report with flush=True to ensure output in batch/containerized environments
+            print(f"\n{'='*70}", flush=True)
+            print(f"Progress Report - {current_time.strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
+            print(f"Elapsed time: {elapsed_str}", flush=True)
+            print(f"Estimated remaining: {remaining_str}", flush=True)
+            print(f"Estimated completion: {estimated_end if isinstance(estimated_end, str) else estimated_end.strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
+            print(f"Total progress: {total_processed}/{total_gRNAs} gRNAs ({100*total_processed/total_gRNAs:.1f}%)", flush=True)
+            
+            if mode == "parallel" and len(counter_snapshot) > 1:
+                print(f"Per-process counts:", flush=True)
+                for i, (count, total) in enumerate(zip(counter_snapshot, chunk_sizes)):
+                    print(f"  Process {i+1:>3}: {count:>5}/{total:>5} gRNAs completed ({100*count/total if total > 0 else 0:.1f}%)", flush=True)
+            
+            print(f"{'='*70}\n", flush=True)
+        except Exception as e:
+            # If progress reporting fails, print error but keep thread alive
+            print(f"Error in progress reporting: {e}", flush=True)
+            print(f"Progress monitoring will continue...", flush=True)
 
 
 def ga_poisson_gauss(input_file, output_dir, start_gRNA = 0, step = None, n_iter = 500, n_counts = None, UMI_threshold = 0,
